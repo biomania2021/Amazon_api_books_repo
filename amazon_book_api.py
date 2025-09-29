@@ -1,98 +1,152 @@
 import numpy as np
 import os
 import time
+import logging
 from amazon_paapi import AmazonApi
 import mysql.connector
 
-# 環境変数から認証情報を取得する
-AMAZON_ACCESS_KEY = os.environ['AMAZON_ACCESS_KEY']
-AMAZON_SECRET_KEY = os.environ['AMAZON_SECRET_KEY']
-AMAZON_ASSOCIATE_TAG = os.environ['AMAZON_ASSOCIATE_TAG']
-country = "JP"
+# ログ設定
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
-# AmazonAPIオブジェクトを作成する
-amazon = AmazonApi(AMAZON_ACCESS_KEY, AMAZON_SECRET_KEY, AMAZON_ASSOCIATE_TAG, country)
+def load_env_vars():
+    """環境変数から認証情報を取得"""
+    try:
+        return {
+            'AMAZON_ACCESS_KEY': os.environ['AMAZON_ACCESS_KEY'],
+            'AMAZON_SECRET_KEY': os.environ['AMAZON_SECRET_KEY'],
+            'AMAZON_ASSOCIATE_TAG': os.environ['AMAZON_ASSOCIATE_TAG'],
+            'AMAZON_ASSOCIATE_ID': os.environ['AMAZON_ASSOCIATE_ID'],
+            'DB_USER': os.environ['DB_USER'],
+            'DB_PASSWORD': os.environ['DB_PASSWORD'],
+            'DB_HOST': os.environ['DB_HOST'],
+            'DB_DATABASE': os.environ['DB_DATABASE']
+        }
+    except KeyError as e:
+        logger.error(f"環境変数 {e} が設定されていません")
+        raise
 
-# MySQLデータベースへの接続
-DB_USER = os.environ['DB_USER']
-DB_PASSWORD = os.environ['DB_PASSWORD']
-DB_HOST = os.environ['DB_HOST']
-DB_DATABASE = os.environ['DB_DATABASE']
+def connect_db(db_config):
+    """MySQLデータベースに接続"""
+    try:
+        conn = mysql.connector.connect(
+            user=db_config['DB_USER'],
+            password=db_config['DB_PASSWORD'],
+            host=db_config['DB_HOST'],
+            database=db_config['DB_DATABASE']
+        )
+        logger.info("データベース接続成功")
+        return conn
+    except mysql.connector.Error as e:
+        logger.error(f"データベース接続エラー: {e}")
+        raise
 
-conn = mysql.connector.connect(
-    user=DB_USER,
-    password=DB_PASSWORD,
-    host=DB_HOST,
-    database=DB_DATABASE,
-    auth_plugin='rd',  # 任意
-    charset='',        # 任意
-)
-c = conn.cursor()
-
-# AmazonアソシエイトのアソシエイトID
-AMAZON_ASSOCIATE_ID = os.environ['AMAZON_ASSOCIATE_ID']
-
-# 検索キーワードのリスト
-KEYWORDS = ['映画', '特撮', 'アニメ', 'フィギュア', '漫画', 'コミック', '模型', '聖地巡礼', 'ライトノベル', '特撮技術', 'サブカルチャー', 'SF小説', 'ゲーム情報', 'アート・建築・デザイン', 'デザイン', 'エンターテイメント', 'ムック', 'ぴあMOOK', 'デアゴスティーニ', 'アシェット・コレクションズ・ジャパン', 'モデル・カーズ', 'ワンテーマ']
-
-for m in KEYWORDS:
-    ASIN = []
-    TITLE = []
-
-    for n in range(5):  # 最大5ページまで取得
+def search_amazon_products(amazon, keyword, max_pages=5):
+    """Amazon APIで書籍データを検索"""
+    asins, titles = [], []
+    for page in range(1, max_pages + 1):
         time.sleep(2)  # API制限対策
         try:
-            products = amazon.search_items(keywords=m, search_index='Books', sort_by='NewestArrivals', item_page=n + 1)
-
-            # products.itemsがNoneの場合の処理を追加
+            products = amazon.search_items(
+                keywords=keyword,
+                search_index='Books',
+                sort_by='NewestArrivals',
+                item_page=page
+            )
             if products and products.items:
                 for product in products.items:
                     try:
-                        ASIN.append(product.asin)
-                        TITLE.append(product.item_info.title.display_value)
-                    except AttributeError:
-                        print(f"商品情報が取得できませんでした。ページ: {n+1}  キーワード: {m}")
-                    except TypeError:
-                        print(f"キーワード '{m}' のページ {n+1} で商品が見つかりませんでした。")
-                        # 次のページまたはキーワードに進む
-                        continue
+                        asins.append(product.asin)
+                        titles.append(product.item_info.title.display_value)
+                        logger.info(f"取得成功: {product.item_info.title.display_value} (ASIN: {product.asin})")
+                    except (AttributeError, TypeError):
+                        logger.warning(f"商品情報取得失敗 (キーワード: {keyword}, ページ: {page})")
             else:
-                print(f"キーワード '{m}' のページ {n+1} で商品が見つかりませんでした。")
-                continue
+                logger.info(f"キーワード '{keyword}' のページ {page} で商品なし")
         except Exception as e:
-            print(f"キーワード '{m}' のページ {n+1} でエラーが発生しました: {e}")
-            continue
+            logger.error(f"検索エラー (キーワード: {keyword}, ページ: {page}): {e}")
+    return asins, titles
 
-    for title, asin in zip(TITLE, ASIN):
-        sql = "SELECT * FROM `amazon_all_data` WHERE `key` = %s"
-        c.execute(sql, (asin,))
-        fig = c.fetchone()
-        print(fig)
-        if not fig:  # データベースに存在しない場合のみ処理
-            c.execute('INSERT INTO `amazon_all_data` VALUES (%s, %s, %s)', (title, asin, asin))
-            c.execute('INSERT INTO `amazon_update_data` VALUES (%s, %s, %s)', (title, asin, asin))
-            print("挿入されたデータを確認:")
+def store_to_db(conn, titles, asins):
+    """データベースにデータを保存"""
+    cursor = conn.cursor()
+    inserted_count = 0
+    for title, asin in zip(titles, asins):
+        try:
+            cursor.execute("SELECT * FROM `amazon_all_data` WHERE `key` = %s", (asin,))
+            if not cursor.fetchone():
+                cursor.execute(
+                    'INSERT INTO `amazon_all_data` VALUES (%s, %s, %s)',
+                    (title, asin, asin)
+                )
+                cursor.execute(
+                    'INSERT INTO `amazon_update_data` VALUES (%s, %s, %s)',
+                    (title, asin, asin)
+                )
+                inserted_count += 1
+                logger.info(f"データ挿入: {title} (ASIN: {asin})")
+        except mysql.connector.Error as e:
+            logger.error(f"データベース挿入エラー (ASIN: {asin}): {e}")
+    conn.commit()
+    logger.info(f"挿入件数: {inserted_count}")
+    return inserted_count
 
-            sql_select = "SELECT * FROM `amazon_update_data` WHERE `key` = %s"
-            c.execute(sql_select, (asin,))
-            inserted_row = c.fetchone()
+def generate_affiliate_links(conn, associate_id):
+    """アフィリエイトリンクを生成"""
+    cursor = conn.cursor()
+    cursor.execute('SELECT * FROM `amazon_update_data`')
+    rows = cursor.fetchall()
+    link_template = '<a href="https://www.amazon.co.jp/dp/{}?tag={}&linkCode=osi&th=1&psc=1" target="_blank">{}</a><br>'
+    affiliate_links = [link_template.format(asin, associate_id, title) for title, asin, _ in rows]
+    return ''.join(affiliate_links)
 
-if inserted_row:
-    print(f"  挿入されたデータ: {inserted_row}")
-else:
-    print("  データの取得に失敗しました。")
+def save_to_file(html_content, filename='affiliate_link_data.txt'):
+    """HTMLリンクをファイルに保存"""
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write(f'<br>新着書籍<br>{html_content}<br>')
+        logger.info(f"リンクを {filename} に保存")
+    except IOError as e:
+        logger.error(f"ファイル保存エラー: {e}")
+        raise
 
-# アフィリエイトリンクの生成
-c.execute('SELECT * FROM `amazon_update_data`')
-rows = c.fetchall()
+def main():
+    """メイン処理"""
+    # 環境変数
+    env_vars = load_env_vars()
+    
+    # Amazon API初期化
+    amazon = AmazonApi(
+        env_vars['AMAZON_ACCESS_KEY'],
+        env_vars['AMAZON_SECRET_KEY'],
+        env_vars['AMAZON_ASSOCIATE_TAG'],
+        country="JP"
+    )
+    
+    # データベース接続
+    conn = connect_db(env_vars)
+    
+    # 検索キーワード
+    keywords = [
+        '映画'
+    ] # そのほかジャンル適宜追加
+    
+    # 書籍データ取得
+    total_inserted = 0
+    for keyword in keywords:
+        asins, titles = search_amazon_products(amazon, keyword)
+        inserted = store_to_db(conn, titles, asins)
+        total_inserted += inserted
+    
+    # アフィリエイトリンク生成
+    affiliate_links = generate_affiliate_links(conn, env_vars['AMAZON_ASSOCIATE_ID'])
+    
+    # ファイル保存
+    save_to_file(affiliate_links)
+    
+    # 終了処理
+    conn.close()
+    logger.info(f"処理完了: {total_inserted} 件のデータを挿入")
 
-A_link = '<a href="https://www.amazon.co.jp/dp/{}?tag={AMAZON_ASSOCIATE_ID}&linkCode=osi&th=1&psc=1" target="_blank">{}</a><br>'
-Affiliate_links = [A_link.format(asin, title) for title, asin, _ in rows]
-
-html_1 = '<br>新着書籍<br>' + ''.join(Affiliate_links) + '<br>'
-
-with open('affiliate_link_data.txt', 'w') as f:
-    f.write(html_1)
-
-conn.commit()
-conn.close()  # データベース接続を閉じる
+if __name__ == "__main__":
+    main()

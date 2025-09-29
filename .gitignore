@@ -1,0 +1,5 @@
+.env
+*.pyc
+__pycache__/
+*.log
+affiliate_link_data.txt
